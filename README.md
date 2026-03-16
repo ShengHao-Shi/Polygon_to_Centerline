@@ -1,123 +1,108 @@
 # Polygon to Centerline
 
-An ArcGIS Python Toolbox (`.pyt`) that converts elongated polygon features
-into polyline features depicting the **centerline** (medial axis / skeleton)
-of each input polygon.
+An open-source and ArcGIS toolbox repository that converts elongated polygon
+features into polyline centerlines.
 
 ---
 
-## Requirements
-
-| Requirement | Version |
-|---|---|
-| ArcGIS Pro | 2.x or later |
-| ArcGIS Desktop (ArcMap) | 10.x with **Standard** or **Advanced** license |
-| Python | 3.x (bundled with ArcGIS Pro) |
-
-The following ArcGIS toolboxes / licenses are used internally:
-
-| Tool | Required license |
-|---|---|
-| `Densify (Edit)` | Standard / Advanced |
-| `Feature Vertices To Points` | Standard / Advanced |
-| `Create Thiessen Polygons` | Standard / Advanced |
-| `Clip` | Basic |
-| `Polygon To Line` | Standard / Advanced |
-| `Smooth Line (Cartography)` | Standard / Advanced |
-
----
-
-## Installation
-
-1. Download or clone this repository.
-2. In **ArcGIS Pro** (or **ArcCatalog / ArcMap**), use the **Add Toolbox**
-   command and browse to `Polygon_to_Centerline.pyt`.
-3. The toolbox **Polygon to Centerline** will appear in the *Geoprocessing*
-   pane, ready to use.
-
----
-
-## Tool: Polygon to Centerline
-
-### Parameters
-
-| # | Parameter | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| 1 | **Input Polygon Features** | Feature Layer (Polygon) | Yes | — | The elongated polygon features whose centerlines you want to extract. |
-| 2 | **Output Centerline Features** | Feature Class (Polyline) | Yes | — | Path for the output polyline feature class. |
-| 3 | **Densification Distance** | Linear Unit | No | `1 Meters` | Distance between added vertices along the polygon boundary. Smaller values produce a more detailed skeleton at the cost of longer processing time. |
-| 4 | **Smoothing Tolerance** | Linear Unit | No | `0 Meters` | PAEK smoothing tolerance applied to the centerline. Set to `0` to skip smoothing. |
-
-### Typical workflow
+## Repository Structure
 
 ```
-Input polygon feature class (roads, rivers, parcels …)
-        │
-        ▼
-[Polygon to Centerline]
-  ├─ Densification Distance : 1 Meters
-  └─ Smoothing Tolerance    : 5 Meters
-        │
-        ▼
-Output centerline polyline feature class
+Polygon_to_Centerline/
+├── arcpy_toolbox/          ArcGIS Python Toolbox (.pyt) – requires ArcGIS Pro / ArcMap
+│   ├── Polygon_to_Centerline.pyt
+│   └── README.md
+├── gdal_centerline/        Open-source implementation – no ArcPy required
+│   ├── centerline.py       Core algorithm (importable module)
+│   ├── cli.py              Command-line interface
+│   ├── requirements.txt    pip / conda dependencies
+│   └── README.md           Full algorithm explanation
+└── README.md               This file
 ```
 
 ---
 
-## Algorithm
+## Two Implementations
 
-The tool implements the **Voronoi / Thiessen skeleton** approach:
+### 1. `arcpy_toolbox/` — ArcGIS Python Toolbox
 
-1. **Densify** — Additional vertices are inserted along the polygon boundary
-   at the specified *Densification Distance* to ensure a dense set of sample
-   points.
-2. **Extract vertices** — All boundary vertices are converted to point
-   features.
-3. **Thiessen polygons** — ArcGIS `Create Thiessen Polygons` tessellates the
-   study area such that every location is assigned to its nearest boundary
-   point. The edges between Thiessen cells whose generating points both lie
-   on the *same* polygon boundary approximate the **medial axis** of that
-   polygon.
-4. **Clip** — The Thiessen polygons are clipped to the footprint of the
-   original polygon to discard cells that fall outside.
-5. **Interior edges** — The clipped Thiessen polygons are converted to line
-   features. Only edges shared by **two** Thiessen cells (`LEFT_FID ≥ 0 AND
-   RIGHT_FID ≥ 0`) are retained — these are the skeleton / centerline edges.
-6. **Smooth** *(optional)* — If a smoothing tolerance > 0 is specified, the
-   PAEK algorithm is applied to produce a smoother curve.
+Uses ArcPy (bundled with ArcGIS Pro / ArcMap) and implements the
+Voronoi / Thiessen-polygon skeleton approach via built-in ArcGIS tools.
 
-### Tips for best results
+| Requirement | |
+|---|---|
+| ArcGIS Pro 2.x+ or ArcMap 10.x | **Standard / Advanced** license |
+| arcpy | Bundled with ArcGIS |
 
-* Choose a **Densification Distance** that is small relative to the width of
-  the polygon (e.g. ≤ 1/5 of the narrowest cross-section).
-* For very long or complex polygons, reduce the densification distance
-  gradually until the skeleton is satisfactory.
-* Apply **Smooth Line** or **Simplify Line** as a post-processing step if the
-  raw skeleton is too jagged.
-* The tool handles **multiple polygon features** in one run; each polygon is
-  treated independently because the Thiessen polygons are clipped to the
-  original polygon footprint.
+See [`arcpy_toolbox/README.md`](arcpy_toolbox/README.md) for installation
+and usage.
 
 ---
 
-## Example
+### 2. `gdal_centerline/` — Open-Source (no ArcPy)
+
+Uses only standard scientific Python libraries available in **Anaconda /
+conda-forge**.  Two algorithms are provided:
+
+| Method | Libraries | Best for |
+|---|---|---|
+| `"voronoi"` (default) | `scipy`, `shapely`, `networkx` | Road / river / building polygons |
+| `"skeleton"` | `scikit-image`, `shapely`, `networkx` | Organic / complex shapes |
+
+**Quick start:**
+
+```bash
+# Install dependencies
+conda install -c conda-forge numpy scipy shapely geopandas scikit-image networkx matplotlib
+# or
+pip install -r gdal_centerline/requirements.txt
+
+# Run on your data
+python gdal_centerline/cli.py input.geojson output.geojson
+
+# With options
+python gdal_centerline/cli.py rivers.gpkg centerlines.gpkg \
+    --method voronoi --densify 0.5 --prune 5.0
+```
+
+**Use as a library:**
 
 ```python
-import arcpy
-from Polygon_to_Centerline import _extract_centerline
+import geopandas as gpd
+from gdal_centerline.centerline import polygon_to_centerline
 
-arcpy.env.workspace = r"C:\data\my_project.gdb"
-
-_extract_centerline(
-    in_features      = "roads_polygon",
-    out_features     = "roads_centerline",
-    densify_distance = "0.5 Meters",
-    smooth_tolerance = "3 Meters",
-)
+gdf = gpd.read_file("my_polygons.geojson")
+centerlines = polygon_to_centerline(gdf, method="voronoi", densify_distance=1.0)
+centerlines.to_file("my_centerlines.geojson", driver="GeoJSON")
 ```
+
+See [`gdal_centerline/README.md`](gdal_centerline/README.md) for the full
+algorithm description and parameter reference.
 
 ---
 
-## License
+## Algorithm Overview (both implementations)
 
-This project is released under the [MIT License](LICENSE).
+Both implementations are based on the **Voronoi / Thiessen skeleton**:
+
+1. **Densify** the polygon boundary (insert extra vertices every N metres).
+2. **Voronoi tessellation** — partition space so every point belongs to
+   its nearest boundary vertex.
+3. **Filter interior edges** — keep only Voronoi ridges that lie fully
+   inside the polygon and whose two generating vertices come from
+   *opposite* sides of the polygon (not adjacent same-side vertices).
+4. **Prune dead-end branches** shorter than a configurable threshold.
+5. **Output** the surviving edges as a polyline feature class / GeoJSON.
+
+The open-source implementation additionally offers a **raster skeleton**
+method (morphological thinning via `scikit-image`).
+
+---
+
+## Example Output
+
+![Centerline demo](https://github.com/user-attachments/assets/b360be4f-c1d0-4add-b5a0-dd552580c379)
+
+*Left: Voronoi (no pruning) · Centre: Voronoi (pruned) · Right: Raster skeleton*
+*Top row: simple rectangle · Bottom row: sinuous strip polygon*
+
