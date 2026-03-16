@@ -81,6 +81,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output file driver (e.g. GeoJSON, 'ESRI Shapefile', GPKG). "
              "Auto-detected from extension if not specified.",
     )
+    p.add_argument(
+        "--multi-line",
+        dest="multi_line",
+        action="store_true",
+        default=False,
+        help="Return the full skeleton (may contain forks / branches). "
+             "By default a single non-branching line is returned.",
+    )
     return p
 
 
@@ -100,6 +108,7 @@ def main(argv=None):
         prune_threshold=args.prune,
         smooth_sigma=args.smooth,
         raster_resolution=args.resolution,
+        single_line=not args.multi_line,
     )
     print(f"  {len(centerlines)} centerline(s) generated.")
 

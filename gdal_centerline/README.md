@@ -48,7 +48,7 @@ centerlines.to_file("my_centerlines.geojson", driver="GeoJSON")
 ### From the command line
 
 ```bash
-# Voronoi method (default)
+# Voronoi method (default) — outputs a single non-branching LineString
 python cli.py input.geojson output.geojson
 
 # Voronoi with custom densification and pruning
@@ -56,6 +56,9 @@ python cli.py rivers.gpkg centerlines.gpkg --densify 0.5 --prune 5.0
 
 # Raster skeleton method
 python cli.py roads.shp roads_cl.shp --method skeleton --densify 1.0 --smooth 2.0
+
+# Return the full skeleton (may contain forks) instead of a single line
+python cli.py input.geojson output.geojson --multi-line
 
 # All options
 python cli.py --help
@@ -117,12 +120,17 @@ Input polygon
       │  branch is removed.  This eliminates end-cap spurs.
       │
       ▼
-⑥ Convert edges to geometry  (shapely.ops.linemerge)
-      │  Surviving graph edges are reassembled into LineString /
-      │  MultiLineString geometries via shapely's linemerge function.
+⑥ Extract single trunk  (networkx + two-pass Dijkstra)
+      │  The skeleton graph may still have short branches at rounded
+      │  end-caps (Y-forks).  To guarantee a single non-branching output:
+      │  • Pass 1 — from an arbitrary leaf, find the farthest leaf u.
+      │  • Pass 2 — from u, find the farthest leaf v.
+      │  • The path u→v is the weighted diameter of the tree (the trunk).
+      │  Only the edges along this path are retained.
+      │  Set single_line=False to skip this step and keep the full skeleton.
       │
       ▼
-Output centerline (vector)
+Output centerline (single LineString, no branches)
 ```
 
 #### Why does the Voronoi diagram approximate the medial axis?
@@ -151,6 +159,7 @@ converges to the true medial axis of the polygon.
 |---|---|---|---|
 | `densify_distance` | float | 1.0 | Max spacing between boundary vertices (CRS units). **Reduce** this for a more detailed / accurate skeleton. |
 | `prune_threshold` | float | 0.0 | Remove branches shorter than this value. 0 = no pruning. |
+| `single_line` | bool | `True` | When True (default), return a single non-branching LineString (longest trunk path). Set to False to return the full skeleton (may contain forks). |
 
 #### Tips
 
@@ -191,17 +200,20 @@ Input polygon
       │  removed.  The result is a 1-pixel-wide skeleton.
       │
       ▼
-④ Trace skeleton to lines  (networkx)
+④ Build weighted pixel graph  (networkx)
       │  Build a graph from the skeleton pixels (nodes) and their
-      │  8-connected neighbours (edges).  Each pixel-pair edge becomes a
-      │  short LineString in world coordinates.
+      │  8-connected neighbours (edges).  Edge weights = Euclidean distance
+      │  between pixel centres (1 for cardinal, √2 for diagonal).
       │
       ▼
-⑤ Merge & return  (shapely.ops.linemerge)
-      │  Merge individual pixel-pair segments into longer, continuous lines.
+⑤ Extract single trunk  (two-pass Dijkstra)
+      │  Same diameter algorithm as the Voronoi method: find the two
+      │  leaf pixels farthest apart by summed edge weight and return only
+      │  the path between them as a single LineString.
+      │  Set single_line=False to keep all pixel-pair edges.
       │
       ▼
-Output centerline (vector)
+Output centerline (single LineString, no branches)
 ```
 
 #### Parameters
@@ -211,6 +223,7 @@ Output centerline (vector)
 | `densify_distance` | float | 1.0 | Used as raster cell size (when `raster_resolution` is not set). |
 | `raster_resolution` | float | None | Explicit raster cell size override. |
 | `smooth_sigma` | float | 0.0 | Gaussian smoothing σ (CRS units) applied before thinning. |
+| `single_line` | bool | `True` | When True (default), return a single non-branching LineString. |
 
 #### Tips
 
@@ -231,8 +244,9 @@ Output centerline (vector)
 | Speed | Fast for simple polygons | Scales with raster size |
 | Handles holes | Yes | Yes |
 | Handles very jagged shapes | May need pruning | Gaussian smoothing helps |
+| Output (default) | Single `LineString` (no forks) | Single `LineString` (no forks) |
 | Best for | Road / river / building footprints | Complex organic shapes |
-| Key parameters | `densify_distance`, `prune_threshold` | `raster_resolution`, `smooth_sigma` |
+| Key parameters | `densify_distance`, `prune_threshold`, `single_line` | `raster_resolution`, `smooth_sigma`, `single_line` |
 
 ---
 

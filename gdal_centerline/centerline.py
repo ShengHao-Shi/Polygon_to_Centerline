@@ -23,15 +23,20 @@ Method A – ``"voronoi"`` (default)
     4. Build a graph from the retained segments (NetworkX).
     5. Iteratively prune dead-end branches (degree-1 nodes) until only the
        main skeleton trunk remains.
-    6. Return the surviving edges as a (Multi)LineString geometry.
+    6. Extract the single longest path through the graph (two-pass Dijkstra
+       diameter algorithm) and return it as a non-branching LineString.
 
 Method B – ``"skeleton"``
     A raster-based morphological skeletonisation approach:
     1. Rasterise the polygon to a binary image at a configurable resolution.
     2. Apply ``skimage.morphology.skeletonize`` (Zhang–Suen thinning).
-    3. Trace the skeleton pixels back to vector line segments.
-    4. Merge collinear segments and simplify the result.
-    5. Return the skeleton as a MultiLineString geometry.
+    3. Build a weighted pixel graph (8-connected, edge weights = Euclidean
+       distance between pixel centres).
+    4. Extract the single longest path using the two-pass Dijkstra diameter
+       algorithm and return it as a non-branching LineString.
+
+Both methods accept a ``single_line=True`` parameter (the default).  Set it
+to ``False`` to recover the original full-skeleton / multi-branch behaviour.
 
 Usage
 -----
@@ -47,7 +52,7 @@ from __future__ import annotations
 
 import math
 import warnings
-from typing import Literal
+from typing import Literal, Sequence
 
 import geopandas as gpd
 import networkx as nx
@@ -84,6 +89,7 @@ def polygon_to_centerline(
     prune_threshold: float = 0.0,
     smooth_sigma: float = 0.0,
     raster_resolution: float | None = None,
+    single_line: bool = True,
 ) -> gpd.GeoDataFrame:
     """
     Convert polygon features to centerline polylines.
@@ -110,6 +116,11 @@ def polygon_to_centerline(
     raster_resolution : float or None
         Cell size for rasterisation (method="skeleton").  If None, it is set
         automatically to densify_distance.
+    single_line : bool
+        When True (default), the output is always a single, non-branching
+        LineString — the longest trunk path through the skeleton graph,
+        found by the two-pass Dijkstra diameter algorithm.  Set to False to
+        return the full skeleton as a MultiLineString (may contain forks).
 
     Returns
     -------
@@ -143,10 +154,10 @@ def polygon_to_centerline(
                 poly = poly.buffer(0)
             try:
                 if method == "voronoi":
-                    cl = _centerline_voronoi(poly, densify_distance, prune_threshold)
+                    cl = _centerline_voronoi(poly, densify_distance, prune_threshold, single_line)
                 elif method == "skeleton":
                     res = raster_resolution if raster_resolution else densify_distance
-                    cl = _centerline_skeleton(poly, res, smooth_sigma)
+                    cl = _centerline_skeleton(poly, res, smooth_sigma, single_line)
                 else:
                     raise ValueError(f"Unknown method: {method!r}")
             except (RuntimeError, ValueError) as exc:
@@ -197,7 +208,8 @@ def _centerline_voronoi(
     polygon: Polygon,
     densify_distance: float,
     prune_threshold: float,
-) -> MultiLineString | LineString | None:
+    single_line: bool = True,
+) -> LineString | MultiLineString | None:
     """
     Compute the centerline of *polygon* using a Voronoi skeleton.
 
@@ -205,10 +217,13 @@ def _centerline_voronoi(
     -----
     1. Densify the polygon boundary.
     2. Compute the Voronoi diagram of the boundary points.
-    3. Keep only ridge segments whose endpoints are both inside the polygon.
+    3. Keep only ridge segments fully inside the polygon, filtering out
+       same-side artefacts via a generator-distance threshold.
     4. Build a graph; iteratively prune degree-1 branches shorter than
        *prune_threshold*.
-    5. Return surviving edges as a (Multi)LineString.
+    5. If *single_line* is True (default), extract the single longest trunk
+       path using the two-pass Dijkstra diameter algorithm and return it as
+       a LineString.  Otherwise return all surviving edges (may contain forks).
     """
     pts = _densify(polygon, densify_distance)
     if len(pts) < 4:
@@ -269,6 +284,14 @@ def _centerline_voronoi(
     if G.number_of_edges() == 0:
         return None
 
+    if single_line:
+        # Extract the single longest trunk (no forks / branches)
+        path_nodes = _extract_longest_path(G)
+        if len(path_nodes) < 2:
+            return None
+        return LineString(list(path_nodes))
+
+    # single_line=False: return the full skeleton (may contain forks)
     lines = [LineString([u, v]) for u, v in G.edges()]
     return linemerge(lines) if lines else None
 
@@ -299,12 +322,9 @@ def _prune_branches(G: nx.Graph, threshold: float) -> nx.Graph:
             current = leaf
             while True:
                 neighbors = list(G.neighbors(current))
-                # Pick the next unvisited node.
-                # Note: when the path has only one node, 'path[0]' is the
-                # leaf itself — we allow moving *to* it in theory, but in
-                # practice a leaf has exactly one neighbour, so this branch
-                # of the condition is never actually taken.  The guard is
-                # written symmetrically for clarity.
+                # Pick the next unvisited node; stop if all neighbours are
+                # already in the path (shouldn't happen for a leaf-started
+                # walk, but acts as a safe guard).
                 nxt = None
                 for nb in neighbors:
                     if nb not in path:
@@ -336,6 +356,47 @@ def _prune_branches(G: nx.Graph, threshold: float) -> nx.Graph:
     return G
 
 
+def _extract_longest_path(G: nx.Graph) -> list:
+    """
+    Find the single longest (by sum of edge weights) path between two leaf
+    nodes (degree = 1) in *G*, using the two-pass Dijkstra diameter algorithm.
+
+    This is the standard O(V + E log V) tree-diameter algorithm:
+      Pass 1 – from an arbitrary leaf, find the farthest leaf *u*.
+      Pass 2 – from *u*, find the farthest leaf *v*.
+    The path u → v is the weighted diameter of the tree and corresponds to
+    the main trunk of the skeleton (no branches / forks).
+
+    For graphs with cycles (rare in Voronoi skeletons) the algorithm still
+    returns the pair of leaves with the maximum shortest-path distance between
+    them, which is a robust proxy for the longest trunk.
+
+    Returns
+    -------
+    list
+        Ordered list of graph nodes from one end of the trunk to the other.
+    """
+    if G.number_of_nodes() < 2:
+        return list(G.nodes())
+
+    leaves = [n for n in G.nodes() if G.degree(n) == 1]
+    if not leaves:
+        # No leaves (all junctions) — pick any two nodes as endpoints
+        leaves = list(G.nodes())
+
+    # Pass 1: distances from an arbitrary starting leaf
+    start = leaves[0]
+    dist1, path1 = nx.single_source_dijkstra(G, start, weight="weight")
+    # Farthest leaf from 'start'
+    u = max(leaves, key=lambda n: dist1.get(n, 0.0))
+
+    # Pass 2: distances from u — finds the true diameter endpoint
+    dist2, path2 = nx.single_source_dijkstra(G, u, weight="weight")
+    v = max(leaves, key=lambda n: dist2.get(n, 0.0))
+
+    return path2.get(v, [u, v])
+
+
 # ---------------------------------------------------------------------------
 # Method B – Raster skeleton
 # ---------------------------------------------------------------------------
@@ -345,7 +406,8 @@ def _centerline_skeleton(
     polygon: Polygon,
     resolution: float,
     smooth_sigma: float = 0.0,
-) -> MultiLineString | None:
+    single_line: bool = True,
+) -> LineString | MultiLineString | None:
     """
     Compute the centerline of *polygon* using raster skeletonisation.
 
@@ -354,9 +416,11 @@ def _centerline_skeleton(
     1. Rasterise the polygon to a binary image at *resolution* cell size.
     2. Optionally apply Gaussian blurring before thinning.
     3. Apply Zhang–Suen thinning (scikit-image ``skeletonize``).
-    4. Trace skeleton pixels to line segments via marching along 8-connected
-       neighbours.
-    5. Return the result as a MultiLineString in the polygon's CRS.
+    4. Build a NetworkX graph of the skeleton pixels (8-connected neighbours,
+       edge weights = Euclidean pixel distance).
+    5. If *single_line* is True (default), extract the longest trunk path
+       using ``_extract_longest_path`` and return it as a single LineString.
+       Otherwise return all pixel-pair edges as a MultiLineString.
     """
     if not _SKIMAGE_AVAILABLE:
         raise ImportError(
@@ -390,14 +454,23 @@ def _centerline_skeleton(
     # Morphological skeletonisation (Zhang–Suen thinning)
     skeleton = _skeletonize(binary)
 
-    # Convert skeleton pixels to line segments
-    lines = _skeleton_to_lines(skeleton, minx, miny, resolution)
+    # Build a weighted graph of skeleton pixels
+    G = _build_skeleton_graph(skeleton, minx, miny, resolution)
 
-    if not lines:
+    if G.number_of_edges() == 0:
         return None
 
-    merged = linemerge(lines)
-    return merged
+    if single_line:
+        # Extract the single longest trunk (no forks / branches)
+        path_pixels = _extract_longest_path(G)
+        if len(path_pixels) < 2:
+            return None
+        coords = [G.nodes[p]["coord"] for p in path_pixels]
+        return LineString(coords)
+
+    # single_line=False: return all skeleton edges as a MultiLineString
+    lines = _graph_to_lines(G)
+    return linemerge(lines) if lines else None
 
 
 def _rasterize_polygon(
@@ -429,46 +502,52 @@ def _rasterize_polygon(
     return binary
 
 
-def _skeleton_to_lines(
+def _build_skeleton_graph(
     skeleton: np.ndarray,
     minx: float,
     miny: float,
     resolution: float,
-) -> list[LineString]:
+) -> nx.Graph:
     """
-    Convert a binary skeleton image to a list of LineString segments by
-    tracing 8-connected pixel paths.
+    Build a weighted NetworkX graph from a binary skeleton image.
+
+    Nodes are (row, col) pixel indices with a ``coord`` attribute giving the
+    world-coordinate centre of each pixel.  Edge weights are the Euclidean
+    pixel distances (1 for cardinal neighbours, √2 for diagonal neighbours).
     """
-    rows, cols = skeleton.shape
-    # Pixel-centre coordinate helper
-    def px_to_coord(r: int, c: int):
+    # Local helper: pixel (r, c) → world-coordinate centre.
+    # Defined as a closure over minx/miny/resolution to avoid passing
+    # three extra arguments through every call site.
+    def px_to_coord(r: int, c: int) -> tuple[float, float]:
         return (minx + (c + 0.5) * resolution, miny + (r + 0.5) * resolution)
 
-    # Build adjacency list from skeleton pixels
     yx = np.argwhere(skeleton)
     if len(yx) == 0:
-        return []
+        return nx.Graph()
 
     pixel_set = set(map(tuple, yx))
     G = nx.Graph()
     for r, c in yx:
-        coord = px_to_coord(r, c)
-        G.add_node((r, c), coord=coord)
+        G.add_node((r, c), coord=px_to_coord(r, c))
         for dr in (-1, 0, 1):
             for dc in (-1, 0, 1):
                 if dr == 0 and dc == 0:
                     continue
                 nb = (r + dr, c + dc)
                 if nb in pixel_set:
-                    G.add_edge((r, c), nb)
+                    # Weight = Euclidean distance between pixel centres
+                    G.add_edge((r, c), nb, weight=math.hypot(dr, dc) * resolution)
 
-    # Convert graph edges to LineStrings
+    return G
+
+
+def _graph_to_lines(G: nx.Graph) -> list[LineString]:
+    """Convert graph edges to a list of two-point LineString segments."""
     lines = []
     for u, v in G.edges():
         cu = G.nodes[u]["coord"]
         cv = G.nodes[v]["coord"]
         lines.append(LineString([cu, cv]))
-
     return lines
 
 
