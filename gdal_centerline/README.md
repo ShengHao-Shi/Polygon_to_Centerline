@@ -317,11 +317,12 @@ cl_full   = polygon_to_centerline(gdf, densify_distance=0.5, single_line=False)
 
 ```
 gdal_centerline/
-├── centerline.py          Core algorithm (importable module)
-├── cli.py                 Command-line interface
-├── GDAL_Centerline.pyt    ArcGIS Python Toolbox (wraps centerline.py)
-├── requirements.txt       pip-compatible dependency list
-└── README.md              This file
+├── centerline.py                    Core algorithm (importable module)
+├── cli.py                           Command-line interface
+├── GDAL_Centerline.pyt              ArcGIS Python Toolbox (wraps centerline.py)
+├── install_dependencies.bat         Helper script to install required packages (Windows)
+├── requirements.txt                 pip-compatible dependency list
+└── README.md                        This file
 ```
 
 ---
@@ -376,10 +377,38 @@ plus one additional field:
 
 ### Installing dependencies in ArcGIS Pro
 
-Open the ArcGIS Pro **Python Command Prompt** and run:
+> **Important:** ArcGIS Pro installs Python into a read-only conda environment
+> (`arcgispro-py3`).  You must **clone** it before installing packages.
+> The included `install_dependencies.bat` handles this for you.
 
-```bash
-conda install -c conda-forge geopandas shapely scipy networkx
-# For method="skeleton" also install:
-conda install -c conda-forge scikit-image
+#### Option A — Automatic (recommended)
+
+1. Open **Start → ArcGIS → ArcGIS Pro Python Command Prompt**.
+2. `cd` into the `gdal_centerline/` folder.
+3. Run `install_dependencies.bat`.
+
+The script detects whether your environment is writable, installs the packages,
+and prints clear guidance if a clone is needed.
+
+#### Option B — Manual (ArcGIS Pro Python Command Prompt)
+
+```bat
+REM Step 1 — Clone the default environment (only once)
+conda create --name arcgispro-py3-gdal --clone arcgispro-py3
+
+REM Step 2 — Install packages into the clone
+activate arcgispro-py3-gdal
+conda install -c conda-forge -y shapely geopandas scipy networkx scikit-image
 ```
+
+Then in ArcGIS Pro:  
+**Project → Python → Python Environments → arcgispro-py3-gdal → OK**  
+Restart ArcGIS Pro.
+
+#### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `CondaError: Read-only` | Default env is read-only | Clone it first (see Step 1 above) |
+| `No module named 'shapely'` | Packages not installed, or wrong env is active | Complete Option A or B above |
+| Install succeeds but tool still fails | ArcGIS Pro is using the old environment | Set the new env in **Project → Python** and restart |

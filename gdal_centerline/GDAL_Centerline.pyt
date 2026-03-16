@@ -74,6 +74,65 @@ _ARCPY_FIELD_TYPE_MAP = {
 }
 
 # ---------------------------------------------------------------------------
+# Pre-flight dependency check (runs once when the toolbox is loaded)
+# ---------------------------------------------------------------------------
+# Probe for required packages at import time so that isLicensed() can surface
+# a friendly error in the tool dialog before the user clicks "Run".
+
+def _check_dependencies():
+    """
+    Return a list of (package_name, import_name) tuples for packages that are
+    NOT currently importable.  An empty list means all dependencies are present.
+    """
+    _required = [
+        ("shapely",    "shapely"),
+        ("geopandas",  "geopandas"),
+        ("scipy",      "scipy"),
+        ("numpy",      "numpy"),
+        ("networkx",   "networkx"),
+        ("pandas",     "pandas"),
+    ]
+    missing = []
+    for pkg_name, import_name in _required:
+        try:
+            __import__(import_name)
+        except ImportError:
+            missing.append(pkg_name)
+    return missing
+
+
+_MISSING_DEPS = _check_dependencies()
+
+# Human-readable install instructions shown in both isLicensed() and execute().
+_INSTALL_HELP = (
+    "\n"
+    "REQUIRED PACKAGES ARE NOT INSTALLED\n"
+    "====================================\n"
+    "Missing: {missing}\n"
+    "\n"
+    "Quick fix — run 'install_dependencies.bat' found in the same\n"
+    "folder as this toolbox (gdal_centerline/).  See README.md for\n"
+    "full instructions.\n"
+    "\n"
+    "Manual installation (ArcGIS Pro Python Command Prompt):\n"
+    "\n"
+    "  Step 1 — Clone the default environment (only once):\n"
+    "    conda create --name arcgispro-py3-gdal --clone arcgispro-py3\n"
+    "\n"
+    "  Step 2 — Install the packages into the clone:\n"
+    "    activate arcgispro-py3-gdal\n"
+    "    conda install -c conda-forge -y shapely geopandas scipy networkx\n"
+    "\n"
+    "  Step 3 — Set the clone as the active environment in ArcGIS Pro:\n"
+    "    Project > Python > Python Environments > arcgispro-py3-gdal\n"
+    "    Restart ArcGIS Pro.\n"
+    "\n"
+    "  Note: The default 'arcgispro-py3' environment is read-only when\n"
+    "  ArcGIS Pro is installed in 'C:\\Program Files\\'.  Cloning it\n"
+    "  creates a writable copy that you can freely extend.\n"
+)
+
+# ---------------------------------------------------------------------------
 # Toolbox
 # ---------------------------------------------------------------------------
 
@@ -213,7 +272,16 @@ class PolygonToCenterlineGDAL(object):
         """
         The tool works with any ArcGIS licence level (Basic / Standard / Advanced).
         All geometry operations are performed by open-source libraries.
+
+        If required Python packages are missing, this method returns False and
+        ArcGIS Pro shows a warning in the tool dialog before the user clicks Run,
+        directing them to install the packages.
         """
+        if _MISSING_DEPS:
+            arcpy.AddWarning(
+                _INSTALL_HELP.format(missing=", ".join(_MISSING_DEPS))
+            )
+            return False
         return True
 
     # ------------------------------------------------------------------
@@ -280,9 +348,7 @@ class PolygonToCenterlineGDAL(object):
             from shapely.wkt import loads as wkt_loads
         except ImportError as exc:
             messages.addErrorMessage(
-                "Required Python package not found: {}.\n"
-                "Install it in the ArcGIS Pro Python environment:\n"
-                "  conda install -c conda-forge geopandas shapely scipy networkx".format(exc)
+                _INSTALL_HELP.format(missing=str(exc).replace("No module named ", ""))
             )
             raise
 
@@ -429,6 +495,10 @@ class PolygonToCenterlineGDAL(object):
             else:
                 fields_to_add.append(fname)
 
+        # Build a name→type lookup so we can cast values appropriately
+        # when inserting into the cursor.
+        _field_type_by_name = {f.name: f.type for f in attr_fields}
+
         # Insert centerline features
         insert_fields = ["SHAPE@WKT", "ORIG_FID"] + fields_to_add
         with arcpy.da.InsertCursor(out_features, insert_fields) as cursor:
@@ -437,10 +507,18 @@ class PolygonToCenterlineGDAL(object):
                 if geom is None or geom.is_empty:
                     continue
                 orig_fid = row.get("ORIG_FID", None)
-                attr_vals = [
-                    str(row[f]) if f in row.index and row[f] is not None else None
-                    for f in fields_to_add
-                ]
+                attr_vals = []
+                for f in fields_to_add:
+                    val = row[f] if f in row.index else None
+                    if val is None:
+                        attr_vals.append(None)
+                    elif _field_type_by_name.get(f) == "String":
+                        # Only coerce to str for text fields; numeric/date
+                        # values are passed as-is so the cursor receives the
+                        # correct Python type (int, float, datetime, …).
+                        attr_vals.append(str(val))
+                    else:
+                        attr_vals.append(val)
                 cursor.insertRow([geom.wkt, orig_fid] + attr_vals)
 
         messages.addMessage(
