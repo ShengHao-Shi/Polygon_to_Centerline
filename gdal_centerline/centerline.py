@@ -15,28 +15,50 @@ Two complementary strategies are implemented and can be selected via the
 Method A – ``"voronoi"`` (default)
     A vector-based Voronoi / Thiessen skeleton approach:
     1. Densify the polygon boundary so that vertices are spaced at most
-       *densify_distance* apart.
+       *densify_distance* apart.  Interior rings (holes) are also densified
+       and their ring membership is recorded alongside the point coordinates.
     2. Compute the Voronoi tessellation of those boundary points using
        ``scipy.spatial.Voronoi``.
-    3. Retain only those Voronoi ridge segments whose **both endpoints** lie
-       **inside** the original polygon (using ``shapely.contains``).
+    3. Apply a two-stage ridge filter:
+       a. Generator-distance filter — remove ridges where both generators lie
+          on the **same** boundary ring and are closer than 3 × densify_distance
+          (same-side artefacts).  Ridges between the outer boundary and an
+          inner hole boundary are **not** distance-filtered so that narrow
+          ring-shaped polygons (e.g. the letter 'O') still produce a
+          centerline.
+       b. Full-segment containment — retain only ridges where the entire
+          segment lies inside the polygon (``shapely.contains``), which
+          automatically excludes ridges that cross through any hole.
     4. Build a graph from the retained segments (NetworkX).
     5. Iteratively prune dead-end branches (degree-1 nodes) until only the
        main skeleton trunk remains.
     6. Extract the single longest path through the graph (two-pass Dijkstra
        diameter algorithm) and return it as a non-branching LineString.
+       For cycle-shaped skeletons (e.g. an 'O' ring) the full closed loop
+       is returned instead.
 
 Method B – ``"skeleton"``
     A raster-based morphological skeletonisation approach:
     1. Rasterise the polygon to a binary image at a configurable resolution.
+       ``shapely.contains`` is used for each pixel centre, correctly excluding
+       pixels that fall inside any hole.
     2. Apply ``skimage.morphology.skeletonize`` (Zhang–Suen thinning).
     3. Build a weighted pixel graph (8-connected, edge weights = Euclidean
        distance between pixel centres).
     4. Extract the single longest path using the two-pass Dijkstra diameter
-       algorithm and return it as a non-branching LineString.
+       algorithm and return it as a non-branching LineString.  For a
+       ring-shaped skeleton the full closed loop is returned.
 
 Both methods accept a ``single_line=True`` parameter (the default).  Set it
 to ``False`` to recover the original full-skeleton / multi-branch behaviour.
+
+Complex polygon shapes are supported:
+  * **Letter 'A'** — polygons with junctions and a triangular hole: the hole
+    boundary is densified, Voronoi ridges through the hole are filtered out by
+    ``polygon.contains``, and the skeleton correctly follows the outer walls.
+  * **Letter 'O'** — ring/donut polygons: cross-ring ridges are preserved by
+    the ring-aware generator-distance filter, the hole interior is never
+    crossed, and ``single_line=True`` returns the full closed ring.
 
 Usage
 -----
@@ -184,15 +206,27 @@ def polygon_to_centerline(
 # ---------------------------------------------------------------------------
 
 
-def _densify(polygon: Polygon, max_distance: float) -> np.ndarray:
+def _densify(polygon: Polygon, max_distance: float) -> tuple[np.ndarray, np.ndarray]:
     """
-    Return an (N, 2) array of the densified exterior-ring coordinates.
-    Interior rings (holes) are also included so the Voronoi diagram
-    correctly represents polygons with holes.
+    Return densified boundary points and their ring membership.
+
+    The exterior ring gets ring index 0; each interior ring (hole) gets
+    indices 1, 2, … in the order Shapely reports them.  This information is
+    used by :func:`_centerline_voronoi` to apply the generator-distance
+    artefact filter only to same-ring pairs, preserving valid cross-ring
+    ridges for polygons with holes.
+
+    Returns
+    -------
+    pts : np.ndarray, shape (N, 2)
+        Densified boundary coordinates.
+    ring_ids : np.ndarray, shape (N,), dtype int
+        Ring index for each point (0 = exterior, ≥1 = hole).
     """
     rings = [polygon.exterior] + list(polygon.interiors)
-    points = []
-    for ring in rings:
+    points: list[np.ndarray] = []
+    ring_ids: list[int] = []
+    for ring_idx, ring in enumerate(rings):
         coords = np.array(ring.coords)
         for i in range(len(coords) - 1):
             p0, p1 = coords[i], coords[i + 1]
@@ -201,7 +235,8 @@ def _densify(polygon: Polygon, max_distance: float) -> np.ndarray:
             for k in range(n_insert):
                 t = k / n_insert
                 points.append(p0 + t * (p1 - p0))
-    return np.array(points)
+                ring_ids.append(ring_idx)
+    return np.array(points), np.array(ring_ids, dtype=int)
 
 
 def _centerline_voronoi(
@@ -225,21 +260,24 @@ def _centerline_voronoi(
        path using the two-pass Dijkstra diameter algorithm and return it as
        a LineString.  Otherwise return all surviving edges (may contain forks).
     """
-    pts = _densify(polygon, densify_distance)
+    pts, ring_ids = _densify(polygon, densify_distance)
     if len(pts) < 4:
         return None
 
     # Voronoi diagram
     vor = Voronoi(pts)
 
-    # Minimum distance between the two generating boundary points.
-    # Same-side adjacent points are ~densify_distance apart and produce
-    # parallel-to-boundary artefact ridges (the "fan" spikes visible at
-    # tight bends).  True centerline ridges bridge OPPOSITE sides of the
-    # polygon and have generators separated by at least ~1 polygon-width.
-    # Requiring gen_dist > 3 × densify_distance reliably removes same-side
-    # artefacts while preserving all cross-polygon (centerline) ridges for
-    # polygons wider than ~3 × densify_distance (the typical use case).
+    # Same-side artefact filter: Voronoi ridges between two adjacent points
+    # on the *same* boundary ring run parallel to the boundary (not through
+    # the polygon interior) and must be suppressed.  We require that the two
+    # generating points be at least 3 × densify_distance apart.
+    #
+    # IMPORTANT: this filter is applied ONLY when both generators belong to the
+    # same ring (exterior↔exterior or hole↔hole).  Ridges between the outer
+    # boundary and an inner hole boundary are genuine centerline ridges even
+    # when the polygon is narrow; suppressing them would leave thin-walled
+    # polygons (e.g. a narrow 'O' ring) with no skeleton at all.  Those cross-
+    # ring ridges are quality-checked solely by polygon.contains() below.
     min_gen_dist = 3.0 * densify_distance
 
     # Collect ridge segments that are fully contained inside the polygon
@@ -250,13 +288,15 @@ def _centerline_voronoi(
             # Infinite ridge — skip
             continue
 
-        # --- Generator-distance filter (same-side artefact removal) ---
         p_idx, q_idx = vor.ridge_points[ridge_idx]
-        gp0 = pts[p_idx]
-        gp1 = pts[q_idx]
-        gen_dist = math.hypot(gp1[0] - gp0[0], gp1[1] - gp0[1])
-        if gen_dist < min_gen_dist:
-            continue
+
+        # --- Generator-distance filter (same-ring artefact removal only) ---
+        if ring_ids[p_idx] == ring_ids[q_idx]:
+            gp0 = pts[p_idx]
+            gp1 = pts[q_idx]
+            gen_dist = math.hypot(gp1[0] - gp0[0], gp1[1] - gp0[1])
+            if gen_dist < min_gen_dist:
+                continue
 
         v0 = vor.vertices[i]
         v1 = vor.vertices[j]
@@ -356,10 +396,55 @@ def _prune_branches(G: nx.Graph, threshold: float) -> nx.Graph:
     return G
 
 
+def _traverse_cycle(G: nx.Graph) -> list:
+    """
+    Walk all nodes of a pure-cycle graph and return a closed node list.
+
+    The first and last elements of the returned list are the same node,
+    producing a closed LineString when converted to coordinates.
+
+    Precondition: the graph is connected, non-empty, and every node has
+    degree exactly 2.  Call sites in :func:`_extract_longest_path` enforce
+    these conditions before delegating here.
+    """
+    if G.number_of_nodes() == 0:
+        return []
+    start = next(iter(G.nodes()))
+    path = [start]
+    prev = None  # previous node (any hashable type the graph uses as node IDs)
+    current = start
+    while True:
+        nxt = None
+        for nb in G.neighbors(current):
+            if nb != prev:
+                nxt = nb
+                break
+        # nxt is None when the single-node degenerate case is reached (degree-0),
+        # or when we've completed the cycle and the only neighbour is prev itself.
+        if nxt is None or nxt == start:
+            path.append(start)  # close the loop
+            break
+        prev = current
+        current = nxt
+        if current == start:
+            path.append(start)
+            break
+        path.append(current)
+    return path
+
+
 def _extract_longest_path(G: nx.Graph) -> list:
     """
     Find the single longest (by sum of edge weights) path between two leaf
     nodes (degree = 1) in *G*, using the two-pass Dijkstra diameter algorithm.
+
+    Special cases handled
+    ---------------------
+    * **Pure-cycle graph** (all nodes degree 2, e.g. 'O' ring skeleton):
+      :func:`_traverse_cycle` is called to return the *full* closed loop
+      instead of just one arc.
+    * **Disconnected graph**: only the largest connected component is
+      considered, preventing Dijkstra from failing across components.
 
     This is the standard O(V + E log V) tree-diameter algorithm:
       Pass 1 – from an arbitrary leaf, find the farthest leaf *u*.
@@ -367,21 +452,30 @@ def _extract_longest_path(G: nx.Graph) -> list:
     The path u → v is the weighted diameter of the tree and corresponds to
     the main trunk of the skeleton (no branches / forks).
 
-    For graphs with cycles (rare in Voronoi skeletons) the algorithm still
-    returns the pair of leaves with the maximum shortest-path distance between
-    them, which is a robust proxy for the longest trunk.
-
     Returns
     -------
     list
-        Ordered list of graph nodes from one end of the trunk to the other.
+        Ordered list of graph nodes from one end of the trunk to the other
+        (or a closed list for cycle graphs).
     """
     if G.number_of_nodes() < 2:
         return list(G.nodes())
 
+    # Work on the largest connected component to handle any disconnection
+    if not nx.is_connected(G):
+        largest_cc = max(nx.connected_components(G), key=len)
+        G = G.subgraph(largest_cc).copy()
+        if G.number_of_nodes() < 2:
+            return list(G.nodes())
+
     leaves = [n for n in G.nodes() if G.degree(n) == 1]
+
     if not leaves:
-        # No leaves (all junctions) — pick any two nodes as endpoints
+        # No degree-1 nodes.  Check if the graph is a pure cycle (all degree 2).
+        if all(G.degree(n) == 2 for n in G.nodes()):
+            # Return the full cycle as a closed path (first == last node).
+            return _traverse_cycle(G)
+        # Mixed graph (cycles + junctions but no leaves) — use all nodes.
         leaves = list(G.nodes())
 
     # Pass 1: distances from an arbitrary starting leaf
