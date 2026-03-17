@@ -256,7 +256,7 @@ class PolygonToCenterlineFast(object):
         p_full.value = False
 
         p_max_pts = arcpy.Parameter(
-            displayName="Max Densify Points (adaptive cap for large polygons)",
+            displayName="Max Densify Points",
             name="max_densify_points",
             datatype="GPLong",
             parameterType="Optional",
