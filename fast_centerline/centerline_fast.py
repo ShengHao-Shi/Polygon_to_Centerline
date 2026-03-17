@@ -153,6 +153,15 @@ except ImportError:  # pragma: no cover
 # batch.  Keeps peak memory under control for very large polygons.
 _CHUNK_SIZE = 2048
 
+# Maximum number of densified points before adaptive adjustment kicks in.
+# Prevents O(N²) memory/time blowup for very large polygons (Plan D).
+_MAX_DENSIFY_POINTS = 100_000
+
+# Chunk size for the ring-edge (K) dimension in _segments_cross_ring_batch.
+# Together with _CHUNK_SIZE (M dimension), limits peak memory to
+# approximately _CHUNK_SIZE × _RING_CHUNK_SIZE × 48 bytes ≈ 384 MB (Plan C).
+_RING_CHUNK_SIZE = 4096
+
 
 # ---------------------------------------------------------------------------
 # WKT parsing helpers (shared with centerline_pure.py — no changes needed)
@@ -270,6 +279,22 @@ def _paths_to_wkt(paths: list) -> Optional[str]:
         pts = ", ".join("{} {}".format(x, y) for x, y in path)
         ring_strs.append("({})".format(pts))
     return "MULTILINESTRING ({})".format(", ".join(ring_strs))
+
+
+# ---------------------------------------------------------------------------
+# Perimeter helper (used by adaptive densification — Plan D)
+# ---------------------------------------------------------------------------
+
+
+def _compute_perimeter(exterior: np.ndarray, holes: list) -> float:
+    """Sum of edge lengths across all polygon rings."""
+    total = 0.0
+    for ring in [exterior] + holes:
+        if len(ring) < 2:
+            continue
+        diffs = ring[1:] - ring[:-1]
+        total += float(np.hypot(diffs[:, 0], diffs[:, 1]).sum())
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +458,7 @@ def _segments_cross_ring_batch(
     v1s: np.ndarray,
     ring: np.ndarray,
     chunk_size: int = _CHUNK_SIZE,
+    ring_chunk_size: int = _RING_CHUNK_SIZE,
 ) -> np.ndarray:
     """
     Test whether each of *M* segments ``[v0s[i], v1s[i]]`` properly crosses
@@ -447,8 +473,10 @@ def _segments_cross_ring_batch(
     Net cost: O(1) numpy call per chunk instead of O(M × K) Python calls.
     Typical speedup: 50–5000× depending on M and K.
 
-    Chunking limits peak memory to ``chunk_size × K × 4 × 8 bytes``:
-    at the default chunk_size=2048 and K=500 ring edges that is ≈ 32 MB.
+    **Dual-dimension chunking** (Plan C): Both the M dimension (segments)
+    and the K dimension (ring edges) are chunked to keep peak memory bounded
+    at approximately ``chunk_size × ring_chunk_size × 48 bytes``.  This
+    prevents out-of-memory crashes when K is very large (e.g. 100K+ edges).
     """
     M = len(v0s)
     if M == 0:
@@ -456,40 +484,52 @@ def _segments_cross_ring_batch(
 
     C = ring[:-1]   # (K, 2) — ring edge start points
     D = ring[1:]    # (K, 2) — ring edge end points
+    K = len(C)
     result = np.zeros(M, dtype=bool)
 
     for start in range(0, M, chunk_size):
         end = min(start + chunk_size, M)
+        chunk_crossed = np.zeros(end - start, dtype=bool)
 
-        # Shape of intermediate arrays: (chunk, K, 2) via broadcasting
-        A = v0s[start:end, None, :]   # (chunk, 1, 2)
-        B = v1s[start:end, None, :]   # (chunk, 1, 2)
-        Ce = C[None, :, :]            # (1, K, 2)
-        De = D[None, :, :]            # (1, K, 2)
+        # Segment endpoints for this M-chunk (shared across all K-chunks)
+        A = v0s[start:end, None, :]   # (chunk_m, 1, 2)
+        B = v1s[start:end, None, :]   # (chunk_m, 1, 2)
+        AB = B - A                    # (chunk_m, 1, 2) — segment direction
 
-        AB = B - A          # (chunk, 1, 2)  — direction of test segment
-        CD = De - Ce        # (1, K,  2)  — direction of ring edge
-        CA = A - Ce         # (chunk, K,  2)
-        CB = B - Ce         # (chunk, K,  2)
-        AC = Ce - A         # (chunk, K,  2)
-        AD = De - A         # (chunk, K,  2)
+        for rstart in range(0, K, ring_chunk_size):
+            rend = min(rstart + ring_chunk_size, K)
 
-        # 2D cross products (z-component):
-        #   d1 = (D-C) × (A-C),  d2 = (D-C) × (B-C)   [signs relative to CD]
-        #   d3 = (B-A) × (C-A),  d4 = (B-A) × (D-A)   [signs relative to AB]
-        d1 = CD[..., 0] * CA[..., 1] - CD[..., 1] * CA[..., 0]  # (chunk, K)
-        d2 = CD[..., 0] * CB[..., 1] - CD[..., 1] * CB[..., 0]  # (chunk, K)
-        d3 = AB[..., 0] * AC[..., 1] - AB[..., 1] * AC[..., 0]  # (chunk, K)
-        d4 = AB[..., 0] * AD[..., 1] - AB[..., 1] * AD[..., 0]  # (chunk, K)
+            Ce = C[rstart:rend][None, :, :]   # (1, chunk_k, 2)
+            De = D[rstart:rend][None, :, :]   # (1, chunk_k, 2)
 
-        # Proper crossing: opposite signs for both pairs
-        crosses = (
-            ((d1 > 0) & (d2 < 0)) | ((d1 < 0) & (d2 > 0))
-        ) & (
-            ((d3 > 0) & (d4 < 0)) | ((d3 < 0) & (d4 > 0))
-        )                                                          # (chunk, K)
+            CD = De - Ce        # (1, chunk_k, 2) — ring edge direction
 
-        result[start:end] = crosses.any(axis=1)
+            # Compute cross products one pair at a time; delete the large
+            # intermediate (chunk_m, chunk_k, 2) arrays immediately after
+            # use to keep peak memory low.
+            CA = A - Ce         # (chunk_m, chunk_k, 2)
+            d1 = CD[..., 0] * CA[..., 1] - CD[..., 1] * CA[..., 0]
+            CB = B - Ce         # (chunk_m, chunk_k, 2)
+            d2 = CD[..., 0] * CB[..., 1] - CD[..., 1] * CB[..., 0]
+            del CA, CB
+
+            AC = Ce - A         # (chunk_m, chunk_k, 2)
+            d3 = AB[..., 0] * AC[..., 1] - AB[..., 1] * AC[..., 0]
+            AD = De - A         # (chunk_m, chunk_k, 2)
+            d4 = AB[..., 0] * AD[..., 1] - AB[..., 1] * AD[..., 0]
+            del AC, AD
+
+            # Proper crossing: opposite signs for both pairs
+            crosses = (
+                ((d1 > 0) & (d2 < 0)) | ((d1 < 0) & (d2 > 0))
+            ) & (
+                ((d3 > 0) & (d4 < 0)) | ((d3 < 0) & (d4 > 0))
+            )                                                  # (chunk_m, chunk_k)
+            del d1, d2, d3, d4
+
+            chunk_crossed |= crosses.any(axis=1)
+
+        result[start:end] = chunk_crossed
 
     return result
 
@@ -636,6 +676,7 @@ def _centerline_voronoi_fast(
     densify_distance: float,
     prune_threshold: float,
     single_line: bool = True,
+    progress_callback=None,
 ):
     """
     Compute the polygon centerline using a Voronoi skeleton — fully vectorised.
@@ -651,15 +692,51 @@ def _centerline_voronoi_fast(
       Stage 2: Batch midpoint PIP for ALL ridges         (Technique 2a)
       Stage 3: Batch crossing test for surviving ridges  (Technique 2b)
       → NO Python loop over ridges.
+
+    Parameters
+    ----------
+    progress_callback : callable or None
+        If provided, called as ``progress_callback(message, percentage)``
+        at each major stage to report progress.  *percentage* is 0–100.
     """
+    def _report(msg, pct=-1):
+        if progress_callback is not None:
+            progress_callback(msg, pct)
+
+    # ---- Adaptive densification (Plan D) --------------------------------
+    perimeter = _compute_perimeter(exterior, holes)
+    estimated_pts = perimeter / densify_distance
+    actual_distance = densify_distance
+
+    if estimated_pts > _MAX_DENSIFY_POINTS:
+        actual_distance = perimeter / _MAX_DENSIFY_POINTS
+        _report(
+            "Auto-adjusting densify distance from {:.4g} to {:.4g} "
+            "(perimeter {:.0f}; capped at {:,} points).".format(
+                densify_distance, actual_distance, perimeter,
+                _MAX_DENSIFY_POINTS),
+            0,
+        )
+        warnings.warn(
+            "Densification distance auto-increased from {:.4g} to {:.4g} "
+            "to keep point count below {:,} (polygon perimeter = {:.0f}).".format(
+                densify_distance, actual_distance, _MAX_DENSIFY_POINTS,
+                perimeter),
+            stacklevel=3,
+        )
+
     # ---- Stage 0: vectorised densification ----------------------------------
-    pts, ring_ids = _densify_fast(exterior, holes, densify_distance)
+    _report("Stage 1/4: Densifying polygon boundary ...", 5)
+    pts, ring_ids = _densify_fast(exterior, holes, actual_distance)
     if len(pts) < 4:
         return None
 
     # ---- Voronoi tessellation -----------------------------------------------
+    _report(
+        "Stage 2/4: Computing Voronoi tessellation "
+        "({:,} points) ...".format(len(pts)), 15)
     vor = Voronoi(pts)
-    min_gen_dist = 3.0 * densify_distance
+    min_gen_dist = 3.0 * actual_distance
 
     rv = np.asarray(vor.ridge_vertices)   # (R, 2)
     rp = np.asarray(vor.ridge_points)     # (R, 2)
@@ -689,6 +766,9 @@ def _centerline_voronoi_fast(
     v0s = vor.vertices[rv[:, 0]]   # (M, 2)
     v1s = vor.vertices[rv[:, 1]]   # (M, 2)
 
+    _report(
+        "Stage 3/4: Filtering {:,} ridges "
+        "(PIP + crossing test) ...".format(len(v0s)), 35)
     keep_mask = _segments_in_polygon_batch(v0s, v1s, exterior, holes)
     v0s = v0s[keep_mask]
     v1s = v1s[keep_mask]
@@ -697,6 +777,9 @@ def _centerline_voronoi_fast(
         return None
 
     # ---- Build NetworkX graph -----------------------------------------------
+    _report(
+        "Stage 4/4: Building graph and extracting centerline "
+        "({:,} edges) ...".format(len(v0s)), 70)
     G = nx.Graph()
     # Batch add all edges at once (faster than one-by-one G.add_edge)
     lengths = np.hypot(v1s[:, 0] - v0s[:, 0], v1s[:, 1] - v0s[:, 1])
@@ -716,8 +799,10 @@ def _centerline_voronoi_fast(
         path_nodes = _extract_longest_path(G)
         if len(path_nodes) < 2:
             return None
+        _report("Centerline extraction complete.", 100)
         return list(path_nodes)
 
+    _report("Centerline extraction complete.", 100)
     return [(u, v) for u, v in G.edges()]
 
 
@@ -857,13 +942,24 @@ def _centerline_skeleton_fast(
     resolution: float,
     smooth_sigma: float = 0.0,
     single_line: bool = True,
+    progress_callback=None,
 ):
     """
     Compute the polygon centerline using raster skeletonisation — fast version.
 
     Uses Technique 3 for rasterisation (all pixels at once) and
     Technique 4 for skeleton graph construction (vectorised edge discovery).
+
+    Parameters
+    ----------
+    progress_callback : callable or None
+        If provided, called as ``progress_callback(message, percentage)``
+        at each major stage to report progress.  *percentage* is 0–100.
     """
+    def _report(msg, pct=-1):
+        if progress_callback is not None:
+            progress_callback(msg, pct)
+
     if not _SKIMAGE_AVAILABLE:
         raise ImportError(
             "scikit-image is required for method='skeleton'. "
@@ -883,30 +979,39 @@ def _centerline_skeleton_fast(
     cols = max(2, math.ceil((maxx - minx) / resolution))
     rows = max(2, math.ceil((maxy - miny) / resolution))
 
+    _report(
+        "Stage 1/4: Rasterising polygon "
+        "({} x {} pixels) ...".format(rows, cols), 10)
     binary = _rasterize_polygon_fast(
         exterior, holes, minx, miny, resolution, rows, cols
     )
 
     if smooth_sigma > 0:
+        _report("Stage 2/4: Applying Gaussian smoothing ...", 30)
         from scipy.ndimage import gaussian_filter
 
         sigma_px = smooth_sigma / resolution
         blurred = gaussian_filter(binary.astype(float), sigma=sigma_px)
         binary = blurred > 0.5
 
+    _report("Stage 3/4: Skeletonising raster ...", 50)
     skeleton = _skeletonize(binary)
 
+    _report("Stage 4/4: Building skeleton graph ...", 70)
     G = _build_skeleton_graph_fast(skeleton, minx, miny, resolution)
 
     if G.number_of_edges() == 0:
         return None
 
     if single_line:
+        _report("Extracting longest path ...", 90)
         path_pixels = _extract_longest_path(G)
         if len(path_pixels) < 2:
             return None
+        _report("Centerline extraction complete.", 100)
         return [G.nodes[p]["coord"] for p in path_pixels]
 
+    _report("Centerline extraction complete.", 100)
     return [(G.nodes[u]["coord"], G.nodes[v]["coord"]) for u, v in G.edges()]
 
 
@@ -923,6 +1028,7 @@ def polygon_to_centerline_wkt(
     smooth_sigma: float = 0.0,
     raster_resolution: Optional[float] = None,
     single_line: bool = True,
+    progress_callback=None,
 ) -> Optional[str]:
     """
     Convert a polygon WKT string to a centerline WKT string — accelerated.
@@ -934,6 +1040,16 @@ def polygon_to_centerline_wkt(
     All geometry computations are fully vectorised with numpy; no shapely,
     geopandas, or pandas are required.  See module docstring for a detailed
     explanation of each acceleration technique.
+
+    Parameters
+    ----------
+    progress_callback : callable or None
+        Optional callback for progress reporting (Plan G).  When provided,
+        called as ``progress_callback(message, percentage)`` at each major
+        processing stage.  *message* is a human-readable status string;
+        *percentage* is an integer 0–100 (or -1 if indeterminate).
+        The callback may be used by the ArcGIS Toolbox to update the
+        progressor label and display elapsed time.
 
     Returns
     -------
@@ -954,11 +1070,13 @@ def polygon_to_centerline_wkt(
                 result = _centerline_voronoi_fast(
                     exterior, holes, densify_distance, prune_threshold,
                     single_line,
+                    progress_callback=progress_callback,
                 )
             elif method == "skeleton":
                 res = raster_resolution if raster_resolution else densify_distance
                 result = _centerline_skeleton_fast(
-                    exterior, holes, res, smooth_sigma, single_line
+                    exterior, holes, res, smooth_sigma, single_line,
+                    progress_callback=progress_callback,
                 )
             else:
                 raise ValueError("Unknown method: {!r}".format(method))

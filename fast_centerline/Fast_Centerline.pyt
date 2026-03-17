@@ -42,6 +42,7 @@ file so that it can be imported at run-time.
 
 import os
 import sys
+import time
 
 import arcpy
 
@@ -339,6 +340,7 @@ class PolygonToCenterlineFast(object):
             )
 
         # ---- Read input polygons -------------------------------------------
+        t0 = time.time()
         messages.addMessage("Step 1/3  Reading input polygon features ...")
 
         desc = arcpy.Describe(in_features)
@@ -360,7 +362,8 @@ class PolygonToCenterlineFast(object):
                 input_rows.append(row)
 
         messages.addMessage(
-            "         {:,} polygon(s) read.".format(len(input_rows))
+            "         {:,} polygon(s) read. [{:.1f}s]".format(
+                len(input_rows), time.time() - t0)
         )
 
         if not input_rows:
@@ -373,10 +376,27 @@ class PolygonToCenterlineFast(object):
             "(method={}, densify={}) ...".format(method, densify_distance)
         )
 
+        n_total = len(input_rows)
+        arcpy.SetProgressor("default", "Computing centerlines ...")
+
+        # Progress callback factory — captures messages, t0, n_total from
+        # the enclosing scope; poly_i and poly_fid are bound per-polygon
+        # via factory arguments to avoid closure-in-a-loop pitfalls.
+        def _make_progress_cb(poly_i, poly_fid):
+            """Create a progress callback for one polygon."""
+            def _cb(msg, pct=-1):
+                elapsed = time.time() - t0
+                label = "Polygon {}/{} (FID {}): {}".format(
+                    poly_i + 1, n_total, poly_fid, msg)
+                messages.addMessage(
+                    "  [{:.1f}s] {}".format(elapsed, label))
+                arcpy.SetProgressorLabel(label)
+            return _cb
+
         results = []
         n_skipped = 0
 
-        for row in input_rows:
+        for i, row in enumerate(input_rows):
             orig_fid = row[0]
             wkt = row[1]
             attr_dict = {
@@ -387,6 +407,8 @@ class PolygonToCenterlineFast(object):
                 n_skipped += 1
                 continue
 
+            progress_cb = _make_progress_cb(i, orig_fid)
+
             try:
                 result_wkt = polygon_to_centerline_wkt(
                     wkt,
@@ -396,6 +418,7 @@ class PolygonToCenterlineFast(object):
                     smooth_sigma=smooth_sigma,
                     raster_resolution=raster_resolution,
                     single_line=single_line,
+                    progress_callback=progress_cb,
                 )
             except Exception as exc:
                 messages.addWarningMessage(
@@ -411,10 +434,11 @@ class PolygonToCenterlineFast(object):
 
         n_out = len(results)
         messages.addMessage(
-            "         {:,} centerline(s) generated{}.".format(
+            "         {:,} centerline(s) generated{}. [{:.1f}s]".format(
                 n_out,
                 " ({:,} polygon(s) skipped)".format(n_skipped)
                 if n_skipped > 0 else "",
+                time.time() - t0,
             )
         )
 
@@ -484,7 +508,10 @@ class PolygonToCenterlineFast(object):
                 ]
                 cursor.insertRow([result_wkt, orig_fid] + attr_vals)
 
-        messages.addMessage("Done.  Output saved to: {}".format(out_features))
+        messages.addMessage(
+            "Done.  Output saved to: {} [{:.1f}s total]".format(
+                out_features, time.time() - t0))
+        arcpy.ResetProgressor()
 
     def postExecute(self, parameters):
         return
