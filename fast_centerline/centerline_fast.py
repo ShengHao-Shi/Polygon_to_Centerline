@@ -155,7 +155,7 @@ _CHUNK_SIZE = 2048
 
 # Maximum number of densified points before adaptive adjustment kicks in.
 # Prevents O(N²) memory/time blowup for very large polygons (Plan D).
-_MAX_DENSIFY_POINTS = 100_000
+_MAX_DENSIFY_POINTS = 10_000
 
 # Chunk size for the ring-edge (K) dimension in _segments_cross_ring_batch.
 # Together with _CHUNK_SIZE (M dimension), limits peak memory to
@@ -1063,7 +1063,7 @@ def polygon_to_centerline_wkt(
     max_densify_points : int
         Maximum number of densified boundary points before adaptive
         adjustment increases ``densify_distance`` automatically (Plan D).
-        Default is 100,000.
+        Default is 10,000.
 
     Returns
     -------

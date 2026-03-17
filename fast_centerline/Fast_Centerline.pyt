@@ -262,7 +262,7 @@ class PolygonToCenterlineFast(object):
             parameterType="Optional",
             direction="Input",
         )
-        p_max_pts.value = 100000
+        p_max_pts.value = 10000
         p_max_pts.category = "Voronoi Options"
 
         return [p_in, p_out, p_method, p_densify, p_prune, p_smooth, p_res, p_full, p_max_pts]
@@ -335,7 +335,7 @@ class PolygonToCenterlineFast(object):
         )
         single_line = not bool(parameters[7].value)
         max_densify_points = (
-            int(parameters[8].value) if parameters[8].value is not None else 100000
+            int(parameters[8].value) if parameters[8].value is not None else 10000
         )
 
         # ---- Import fast algorithm -----------------------------------------
